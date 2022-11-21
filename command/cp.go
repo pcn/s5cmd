@@ -41,6 +41,9 @@ Examples:
 	01. Download an S3 object to working directory
 		 > s5cmd {{.HelpName}} s3://bucket/prefix/object.gz .
 
+  01a. Download more than one s3 object into one file in the order provided. AWS recommends not using the # as a key name, so use that to separate objects
+     > s5cmd {{.HelpName}} -b s3://bucket/prefix/objectpt1#s3://bucket/prefix/objectpt2#s3://bucket/prefix/objectpt?... local_filename
+
 	02. Download an S3 object and rename
 		 > s5cmd {{.HelpName}} s3://bucket/prefix/object.gz myobject.gz
 
@@ -207,6 +210,11 @@ func NewCopyCommandFlags() []cli.Flag {
 			Aliases: []string{"u"},
 			Usage:   "only overwrite destination if source modtime is newer",
 		},
+		&cli.BoolFlag{
+			Name:    "split-file",
+			Aliases: []string{"b"}, // mnemonic: broken-up-file?
+			Usage:   "A file that is larger than s3 permits will be reconstructed from multiple s3 objects in the same path, separated by a #",
+		},
 	}
 	sharedFlags := NewSharedFlags()
 	return append(copyFlags, sharedFlags...)
@@ -274,6 +282,9 @@ type Copy struct {
 	concurrency int
 	partSize    int64
 	storageOpts storage.Options
+
+	// is this a multipart split'd file that needs to be sequentially join'd?
+	isSplit bool
 }
 
 // NewCopy creates Copy from cli.Context.
@@ -290,6 +301,7 @@ func NewCopy(c *cli.Context, deleteSource bool) Copy {
 		ifSourceNewer:         c.Bool("if-source-newer"),
 		flatten:               c.Bool("flatten"),
 		followSymlinks:        !c.Bool("no-follow-symlinks"),
+		isSplit:               c.Bool("split-file"),
 		storageClass:          storage.StorageClass(c.String("storage-class")),
 		concurrency:           c.Int("concurrency"),
 		partSize:              c.Int64("part-size") * megabytes,
@@ -459,11 +471,22 @@ func (c Copy) prepareDownloadTask(
 	isBatch bool,
 ) func() error {
 	return func() error {
-		dsturl, err := prepareLocalDestination(ctx, srcurl, dsturl, c.flatten, isBatch, c.storageOpts)
+		dsturl, err := prepareLocalDestination(ctx, srcurl, dsturl, c.flatten, c.isSplit, c.storageOpts)
 		if err != nil {
 			return err
 		}
-		err = c.doDownload(ctx, srcurl, dsturl)
+		// XXX PCN: This is where the destination is written to, so dive in here
+		if c.isSplit {
+			bigPieces := strings.Split(srcurl.String(), "#")
+			var partUrl *url.URL
+			*partUrl = *srcurl
+			for _, partPath := range bigPieces {
+				partUrl.Path = partPath
+				c.doDownload(ctx, partUrl, dsturl)
+			}
+		} else {
+			err = c.doDownload(ctx, srcurl, dsturl)
+		}
 		if err != nil {
 			return &errorpkg.Error{
 				Op:  c.op,
@@ -498,6 +521,8 @@ func (c Copy) prepareUploadTask(
 }
 
 // doDownload is used to fetch a remote object and save as a local object.
+// Wherever this is called from is where I need to split up the possible pieces
+// XXX PCN how/where is this invoked?
 func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) error {
 	srcClient, err := storage.NewRemoteClient(ctx, srcurl, c.storageOpts)
 	if err != nil {
@@ -516,9 +541,18 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 		return err
 	}
 
-	file, err := dstClient.Create(dsturl.Absolute())
-	if err != nil {
-		return err
+	var file *os.File
+
+	if c.isSplit {
+		file, err = dstClient.Append(dsturl.Absolute())
+		if err != nil {
+			return err
+		}
+	} else {
+		file, err = dstClient.Create(dsturl.Absolute())
+		if err != nil {
+			return err
+		}
 	}
 
 	size, err := srcClient.Get(ctx, srcurl, file, c.concurrency, c.partSize)
@@ -771,6 +805,8 @@ func prepareRemoteDestination(
 
 // prepareDownloadDestination will return a new destination URL for
 // remote->local copy operations.
+// XXX PCN: where does this get called? That's where the destination needs to be opened O_APPEND
+// XXX PCN: the storage.Options has isAppend
 func prepareLocalDestination(
 	ctx context.Context,
 	srcurl *url.URL,
