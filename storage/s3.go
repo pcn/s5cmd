@@ -420,6 +420,8 @@ func (s *S3) Get(
 		return 0, nil
 	}
 
+	// For this to work it probably needs this to land in go's stdlib
+	// https://github.com/golang/go/commit/dc8e2a6a8ec94f2c98ba20edd57932eba284efb1
 	return s.downloader.DownloadWithContext(ctx, to, &s3.GetObjectInput{
 		Bucket:       aws.String(from.Bucket),
 		Key:          aws.String(from.Path),

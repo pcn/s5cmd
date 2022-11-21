@@ -213,6 +213,28 @@ func (f *Filesystem) Create(path string) (*os.File, error) {
 	return os.Create(path)
 }
 
+// Create creates a new os.File, or opens a file to the end.
+func (f *Filesystem) Append(path string) (*os.File, error) {
+	if f.dryRun {
+		return &os.File{}, nil
+	}
+
+	// I don't think we want O_APPEND since parallel downloads will write
+	// to various offsets in the file, we want a file opened with the fd set
+	// to the end of the file
+	_, err := os.Stat(path)
+	if err == nil {
+		fd, err := os.OpenFile(path, os.O_RDWR, 0666)
+		if err != nil {
+			return nil, err
+		}
+		fd.Seek(0, 2)
+		return fd, nil
+	} else {
+		return os.Create(path)
+	}
+}
+
 // Open opens the given source.
 func (f *Filesystem) Open(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_RDONLY, 0644)
